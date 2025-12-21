@@ -6,7 +6,7 @@ from PIL import Image, ImageEnhance, ImageDraw, ImageFont
 import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup, NavigableString
-import pyphen  # <--- Essential for PyMuPDF
+import pyphen
 import base64
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -26,6 +26,7 @@ DEFAULT_TOP_PADDING = 15
 
 
 # --- UTILITY FUNCTIONS ---
+# (No changes here, keeping existing utilities)
 
 def fix_css_font_paths(css_text, target_font_family="'CustomFont'"):
     if target_font_family is None:
@@ -80,7 +81,6 @@ def get_official_toc_mapping(book):
     return mapping
 
 
-# --- IMPROVED HYPHENATION FUNCTION ---
 def hyphenate_html_text(soup, language_code):
     try:
         dic = pyphen.Pyphen(lang=language_code)
@@ -99,13 +99,7 @@ def hyphenate_html_text(soup, language_code):
             continue
 
         original_text = str(text_node)
-
-        # --- FIX: FORCE NORMAL SPACES ---
-        # 1. Replace Non-Breaking Space (\u00A0) with a standard space.
-        # This allows the "Justify" alignment to stretch this space evenly with the others.
         clean_text = original_text.replace('\u00A0', ' ')
-
-        # --------------------------------
 
         def replace_match(match):
             word = match.group(0)
@@ -164,8 +158,10 @@ class EpubProcessor:
         self.toc_items_per_page = 18
         self.is_ready = False
 
+    # --- UPDATED: Added 'orientation' parameter ---
     def load_and_layout(self, input_path, font_path, font_size, margin, line_height, font_weight,
-                        bottom_padding, top_padding, text_align="justify", add_toc=True, progress_callback=None):
+                        bottom_padding, top_padding, text_align="justify", orientation="Portrait", add_toc=True,
+                        progress_callback=None):
         self.input_file = input_path
         self.font_path = font_path if font_path != "DEFAULT" else ""
         self.font_size = font_size
@@ -175,6 +171,18 @@ class EpubProcessor:
         self.bottom_padding = bottom_padding
         self.top_padding = top_padding
         self.text_align = text_align
+
+        # 1. SETUP DIMENSIONS
+        if orientation == "Landscape":
+            # For Landscape: Width is the larger number (800), Height is smaller (480)
+            self.screen_width = DEFAULT_SCREEN_HEIGHT  # 800
+            self.screen_height = DEFAULT_SCREEN_WIDTH  # 480
+        else:
+            # For Portrait: Width is smaller (480), Height is larger (800)
+            self.screen_width = DEFAULT_SCREEN_WIDTH  # 480
+            self.screen_height = DEFAULT_SCREEN_HEIGHT  # 800
+
+        print(f"--- DEBUG: Target Screen Dims: {self.screen_width} x {self.screen_height} ---")
 
         for doc, _ in self.fitz_docs: doc.close()
         self.fitz_docs, self.page_map, self.toc_data = [], [], []
@@ -193,11 +201,11 @@ class EpubProcessor:
             font_face_rule = ""
             font_family_val = "serif"
 
-        # CSS: We keep 'hyphens: auto' as a fallback, but we rely on Python injection
+        # CSS: We keep @page here, but doc.layout() below is the real enforcer.
         custom_css = f"""
         <style>
             {font_face_rule}
-            @page {{ margin: 0; }}
+            @page {{ size: {self.screen_width}pt {self.screen_height}pt; margin: 0; }}
 
             body, p, div, span, li, blockquote, dd, dt {{
                 font-family: {font_family_val} !important;
@@ -208,20 +216,15 @@ class EpubProcessor:
                 color: black !important;
                 overflow-wrap: break-word;
             }}
-
             body {{
                 margin: 0 !important;
                 padding: {self.margin}px !important;
                 background-color: white !important;
+                width: 100% !important; 
+                height: 100% !important;
             }}
-
-            img {{ max-width: 95% !important; height: auto !important; display: block; margin: 50px auto !important; }}
-
-            h1, h2, h3 {{ 
-                text-align: center !important; 
-                margin-top: 1em; 
-                font-weight: {min(900, self.font_weight + 200)} !important; 
-            }}
+            img {{ max-width: 95% !important; height: auto !important; display: block; margin: 20px auto !important; }}
+            h1, h2, h3 {{ text-align: center !important; margin-top: 1em; font-weight: {min(900, self.font_weight + 200)} !important; }}
         </style>
         """
 
@@ -265,8 +268,6 @@ class EpubProcessor:
                 src = os.path.basename(img_tag.get('src', ''))
                 if src in image_map: img_tag['src'] = image_map[src]
 
-            # --- KEY FIX: Smart Hyphenation ---
-            # We call the improved function here.
             soup = hyphenate_html_text(soup, book_lang)
 
             body_content = "".join([str(x) for x in soup.body.contents]) if soup.body else str(soup)
@@ -275,7 +276,21 @@ class EpubProcessor:
             with open(temp_html_path, "w", encoding="utf-8") as f:
                 f.write(final_html)
 
+            # 2. OPEN DOCUMENT
             doc = fitz.open(temp_html_path)
+
+            # 3. FIX: FORCE LAYOUT REFLOW
+            # This is the magic line. It tells PyMuPDF: "Ignore A4 defaults.
+            # Layout the text specifically for this width/height rectangle."
+            rect = fitz.Rect(0, 0, self.screen_width, self.screen_height)
+            doc.layout(rect=rect)
+
+            # --- DEBUG: Print what PyMuPDF actually created ---
+            if idx == 0:
+                p = doc[0]
+                print(f"--- DEBUG: Generated PDF Page Size: {p.rect.width} x {p.rect.height} ---")
+            # ---------------------------------------------------
+
             self.fitz_docs.append((doc, has_image))
             for i in range(len(doc)): self.page_map.append((len(self.fitz_docs) - 1, i))
             running_page_count += len(doc)
@@ -377,6 +392,7 @@ class EpubProcessor:
             pix = page.get_pixmap(matrix=mat, alpha=False)
 
             img_content = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            # Use self.screen_width (which is now dynamic)
             img_content = img_content.resize((self.screen_width, content_height), Image.Resampling.LANCZOS).convert("L")
 
             img = Image.new("RGB", (self.screen_width, self.screen_height), (255, 255, 255))
@@ -460,9 +476,17 @@ class App(ctk.CTk):
         self.lbl_file = ctk.CTkLabel(self.sidebar, text="No file", text_color="gray")
         self.lbl_file.pack()
 
+
         self.var_toc = ctk.BooleanVar(value=True)
         self.check_toc = ctk.CTkCheckBox(self.sidebar, text="Generate TOC Pages", variable=self.var_toc)
         self.check_toc.pack(padx=20, pady=10, anchor="w")
+
+        # --- UPDATED: Orientation Dropdown ---
+        ctk.CTkLabel(self.sidebar, text="Orientation:").pack(pady=(10, 0))
+        self.orientation_var = ctk.StringVar(value="Portrait")
+        self.orientation_dropdown = ctk.CTkOptionMenu(self.sidebar, values=["Portrait", "Landscape"],
+                                                      variable=self.orientation_var)
+        self.orientation_dropdown.pack(padx=20, pady=5, fill="x")
 
         ctk.CTkLabel(self.sidebar, text="Text Alignment:").pack(pady=(10, 0))
         self.align_dropdown = ctk.CTkOptionMenu(self.sidebar, values=["justify", "left"])
@@ -588,6 +612,8 @@ class App(ctk.CTk):
             int(self.slider_padding.get()),
             int(self.slider_top_padding.get()),
             text_align=self.align_dropdown.get(),
+            # --- UPDATED: Pass orientation ---
+            orientation=self.orientation_var.get(),
             add_toc=self.var_toc.get(),
             progress_callback=lambda v: self.update_progress_ui(v, "Layout")
         )
@@ -605,9 +631,25 @@ class App(ctk.CTk):
         if not self.processor.is_ready: return
         self.current_page_index = idx
         img = self.processor.render_page(idx)
+
+        # --- UPDATED: Preview resizing logic to handle different aspect ratios ---
         available_h = max(100, self.preview_frame.winfo_height() - 100)
-        w = int(img.width * (available_h / img.height))
-        ctk_img = ctk.CTkImage(light_image=img, size=(w, available_h))
+        available_w = max(100, self.preview_frame.winfo_width() - 50)
+
+        # Calculate aspect ratios
+        img_aspect = img.width / img.height
+        frame_aspect = available_w / available_h
+
+        if img_aspect > frame_aspect:
+            # Limited by width
+            w = available_w
+            h = int(w / img_aspect)
+        else:
+            # Limited by height
+            h = available_h
+            w = int(h * img_aspect)
+
+        ctk_img = ctk.CTkImage(light_image=img, size=(w, h))
         self.img_label.configure(image=ctk_img, text="")
         self.lbl_page.configure(text=f"Page {idx + 1} / {self.processor.total_pages}")
 
