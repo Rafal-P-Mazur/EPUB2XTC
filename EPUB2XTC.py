@@ -26,8 +26,6 @@ DEFAULT_TOP_PADDING = 15
 
 
 # --- UTILITY FUNCTIONS ---
-# (No changes here, keeping existing utilities)
-
 def fix_css_font_paths(css_text, target_font_family="'CustomFont'"):
     if target_font_family is None:
         return css_text
@@ -135,11 +133,70 @@ def get_local_fonts():
     return sorted(fonts)
 
 
+# --- POPUP DIALOG FOR CHAPTER SELECTION ---
+class ChapterSelectionDialog(ctk.CTkToplevel):
+    def __init__(self, parent, chapters_list, callback):
+        super().__init__(parent)
+        self.callback = callback
+        self.chapters_list = chapters_list
+        self.title("Select Chapters for TOC")
+        self.geometry("500x600")
+
+        self.transient(parent)
+        self.grab_set()
+
+        self.lbl_info = ctk.CTkLabel(self,
+                                     text="Uncheck chapters to hide them from the TOC and Progress Bar.\n(They will still be readable in the book)",
+                                     wraplength=450)
+        self.lbl_info.pack(pady=10)
+
+        self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.btn_frame.pack(fill="x", padx=20)
+
+        ctk.CTkButton(self.btn_frame, text="Select All", width=100, command=self.select_all).pack(side="left", padx=5)
+        ctk.CTkButton(self.btn_frame, text="Select None", width=100, command=self.select_none).pack(side="left", padx=5)
+
+        self.scroll_frame = ctk.CTkScrollableFrame(self)
+        self.scroll_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+        self.check_vars = []
+        for i, chap in enumerate(chapters_list):
+            var = ctk.BooleanVar(value=True)
+            self.check_vars.append(var)
+            chk = ctk.CTkCheckBox(self.scroll_frame, text=f"{i + 1}. {chap['title']}", variable=var)
+            chk.pack(anchor="w", pady=2, padx=5)
+
+        self.btn_confirm = ctk.CTkButton(self, text="Confirm Selection", command=self.confirm)
+        self.btn_confirm.pack(pady=20)
+
+    def select_all(self):
+        for var in self.check_vars: var.set(True)
+
+    def select_none(self):
+        for var in self.check_vars: var.set(False)
+
+    def confirm(self):
+        selected_indices = [i for i, var in enumerate(self.check_vars) if var.get()]
+        if not selected_indices:
+            if not messagebox.askyesno("Warning",
+                                       "No chapters selected for TOC. The book will have no navigation. Continue?"):
+                return
+
+        self.grab_release()
+        self.destroy()
+        self.callback(selected_indices)
+
+
 # --- PROCESSING ENGINE ---
 
 class EpubProcessor:
     def __init__(self):
         self.input_file = ""
+        self.raw_chapters = []
+        self.book_css = ""
+        self.book_images = {}
+        self.book_lang = 'en'
+
         self.font_path = ""
         self.font_size = DEFAULT_FONT_SIZE
         self.margin = DEFAULT_MARGIN
@@ -150,6 +207,7 @@ class EpubProcessor:
         self.text_align = "justify"
         self.screen_width = DEFAULT_SCREEN_WIDTH
         self.screen_height = DEFAULT_SCREEN_HEIGHT
+
         self.fitz_docs = []
         self.toc_data_final = []
         self.toc_pages_images = []
@@ -158,11 +216,53 @@ class EpubProcessor:
         self.toc_items_per_page = 18
         self.is_ready = False
 
-    # --- UPDATED: Added 'orientation' parameter ---
-    def load_and_layout(self, input_path, font_path, font_size, margin, line_height, font_weight,
+    def parse_book_structure(self, input_path):
+        self.input_file = input_path
+        self.raw_chapters = []
+
+        try:
+            book = epub.read_epub(self.input_file)
+        except Exception as e:
+            print(f"Error reading EPUB: {e}")
+            return False
+
+        try:
+            self.book_lang = book.get_metadata('DC', 'language')[0][0]
+        except:
+            self.book_lang = 'en'
+
+        self.book_images = extract_images_to_base64(book)
+        self.book_css = extract_all_css(book)
+        toc_mapping = get_official_toc_mapping(book)
+
+        items = [book.get_item_with_id(item_ref[0]) for item_ref in book.spine
+                 if isinstance(book.get_item_with_id(item_ref[0]), epub.EpubHtml)]
+
+        for idx, item in enumerate(items):
+            item_name = item.get_name()
+            raw_html = item.get_content().decode('utf-8', errors='replace')
+            soup = BeautifulSoup(raw_html, 'html.parser')
+            text_content = soup.get_text().strip()
+            has_image = bool(soup.find('img'))
+
+            if item_name not in toc_mapping and len(text_content) < 50 and not has_image:
+                continue
+
+            chapter_title = toc_mapping.get(item_name) or (soup.find(['h1', 'h2']).get_text().strip() if soup.find(
+                ['h1', 'h2']) else f"Section {len(self.raw_chapters) + 1}")
+
+            self.raw_chapters.append({
+                'title': chapter_title,
+                'soup': soup,
+                'has_image': has_image
+            })
+
+        return True
+
+    def render_chapters(self, selected_indices, font_path, font_size, margin, line_height, font_weight,
                         bottom_padding, top_padding, text_align="justify", orientation="Portrait", add_toc=True,
                         progress_callback=None):
-        self.input_file = input_path
+
         self.font_path = font_path if font_path != "DEFAULT" else ""
         self.font_size = font_size
         self.margin = margin
@@ -172,26 +272,15 @@ class EpubProcessor:
         self.top_padding = top_padding
         self.text_align = text_align
 
-        # 1. SETUP DIMENSIONS
         if orientation == "Landscape":
-            # For Landscape: Width is the larger number (800), Height is smaller (480)
-            self.screen_width = DEFAULT_SCREEN_HEIGHT  # 800
-            self.screen_height = DEFAULT_SCREEN_WIDTH  # 480
+            self.screen_width = DEFAULT_SCREEN_HEIGHT
+            self.screen_height = DEFAULT_SCREEN_WIDTH
         else:
-            # For Portrait: Width is smaller (480), Height is larger (800)
-            self.screen_width = DEFAULT_SCREEN_WIDTH  # 480
-            self.screen_height = DEFAULT_SCREEN_HEIGHT  # 800
-
-        print(f"--- DEBUG: Target Screen Dims: {self.screen_width} x {self.screen_height} ---")
+            self.screen_width = DEFAULT_SCREEN_WIDTH
+            self.screen_height = DEFAULT_SCREEN_HEIGHT
 
         for doc, _ in self.fitz_docs: doc.close()
-        self.fitz_docs, self.page_map, self.toc_data = [], [], []
-
-        try:
-            book = epub.read_epub(self.input_file)
-        except Exception as e:
-            print(f"Error reading EPUB: {e}")
-            return False
+        self.fitz_docs, self.page_map = [], []
 
         if self.font_path:
             css_font_path = self.font_path.replace("\\", "/")
@@ -201,12 +290,12 @@ class EpubProcessor:
             font_face_rule = ""
             font_family_val = "serif"
 
-        # CSS: We keep @page here, but doc.layout() below is the real enforcer.
+        patched_css = fix_css_font_paths(self.book_css, font_family_val)
+
         custom_css = f"""
         <style>
             {font_face_rule}
             @page {{ size: {self.screen_width}pt {self.screen_height}pt; margin: 0; }}
-
             body, p, div, span, li, blockquote, dd, dt {{
                 font-family: {font_family_val} !important;
                 font-size: {self.font_size}pt !important;
@@ -228,87 +317,60 @@ class EpubProcessor:
         </style>
         """
 
-        try:
-            book_lang = book.get_metadata('DC', 'language')[0][0]
-        except:
-            book_lang = 'en'
-
-        image_map = extract_images_to_base64(book)
-        original_css = fix_css_font_paths(extract_all_css(book), font_family_val)
-        toc_mapping = get_official_toc_mapping(book)
-
-        items = [book.get_item_with_id(item_ref[0]) for item_ref in book.spine
-                 if isinstance(book.get_item_with_id(item_ref[0]), epub.EpubHtml)]
-
         temp_chapter_starts = []
         running_page_count = 0
-
-        render_dir = os.path.dirname(input_path)
+        render_dir = os.path.dirname(self.input_file)
         temp_html_path = os.path.join(render_dir, "render_temp.html")
 
-        self.toc_data = []
-        for idx, item in enumerate(items):
-            if progress_callback: progress_callback((idx / len(items)) * 0.9)
+        final_toc_titles = []
+        total_chaps = len(self.raw_chapters)
+        selected_set = set(selected_indices)
 
-            item_name = item.get_name()
-            raw_html = item.get_content().decode('utf-8', errors='replace')
-            soup = BeautifulSoup(raw_html, 'html.parser')
+        for idx, chapter in enumerate(self.raw_chapters):
+            if progress_callback: progress_callback((idx / total_chaps) * 0.9)
 
-            has_image = bool(soup.find('img'))
-            text_content = soup.get_text().strip()
-
-            if item_name not in toc_mapping and len(text_content) < 50 and not has_image: continue
-
-            temp_chapter_starts.append(running_page_count)
-            chapter_title = toc_mapping.get(item_name) or (soup.find(['h1', 'h2']).get_text().strip() if soup.find(
-                ['h1', 'h2']) else f"Section {len(self.toc_data) + 1}")
-            self.toc_data.append(chapter_title)
+            soup = chapter['soup']
 
             for img_tag in soup.find_all('img'):
                 src = os.path.basename(img_tag.get('src', ''))
-                if src in image_map: img_tag['src'] = image_map[src]
+                if src in self.book_images: img_tag['src'] = self.book_images[src]
 
-            soup = hyphenate_html_text(soup, book_lang)
+            soup = hyphenate_html_text(soup, self.book_lang)
+
+            if idx in selected_set:
+                temp_chapter_starts.append(running_page_count)
+                final_toc_titles.append(chapter['title'])
 
             body_content = "".join([str(x) for x in soup.body.contents]) if soup.body else str(soup)
-            final_html = f"<html lang='{book_lang}'><head><style>{original_css}</style>{custom_css}</head><body>{body_content}</body></html>"
+            final_html = f"<html lang='{self.book_lang}'><head><style>{patched_css}</style>{custom_css}</head><body>{body_content}</body></html>"
 
             with open(temp_html_path, "w", encoding="utf-8") as f:
                 f.write(final_html)
 
-            # 2. OPEN DOCUMENT
             doc = fitz.open(temp_html_path)
-
-            # 3. FIX: FORCE LAYOUT REFLOW
-            # This is the magic line. It tells PyMuPDF: "Ignore A4 defaults.
-            # Layout the text specifically for this width/height rectangle."
             rect = fitz.Rect(0, 0, self.screen_width, self.screen_height)
             doc.layout(rect=rect)
 
-            # --- DEBUG: Print what PyMuPDF actually created ---
-            if idx == 0:
-                p = doc[0]
-                print(f"--- DEBUG: Generated PDF Page Size: {p.rect.width} x {p.rect.height} ---")
-            # ---------------------------------------------------
-
-            self.fitz_docs.append((doc, has_image))
+            self.fitz_docs.append((doc, chapter['has_image']))
             for i in range(len(doc)): self.page_map.append((len(self.fitz_docs) - 1, i))
+
             running_page_count += len(doc)
 
         if os.path.exists(temp_html_path): os.remove(temp_html_path)
 
-        if add_toc:
+        if add_toc and final_toc_titles:
             toc_header_space = 100 + self.top_padding
             toc_row_height = 35
             available_h = self.screen_height - self.bottom_padding - toc_header_space
 
             self.toc_items_per_page = max(1, int(available_h // toc_row_height))
-            num_toc_pages = (len(self.toc_data) + self.toc_items_per_page - 1) // self.toc_items_per_page
+            num_toc_pages = (len(final_toc_titles) + self.toc_items_per_page - 1) // self.toc_items_per_page
 
-            self.toc_data_final = [(t, temp_chapter_starts[i] + num_toc_pages + 1) for i, t in enumerate(self.toc_data)]
+            self.toc_data_final = [(t, temp_chapter_starts[i] + num_toc_pages + 1) for i, t in
+                                   enumerate(final_toc_titles)]
             self.toc_pages_images = self._render_toc_pages(self.toc_data_final)
         else:
-            self.toc_data_final = [(t, temp_chapter_starts[i] + 1) for i, t in enumerate(self.toc_data)]
+            self.toc_data_final = [(t, temp_chapter_starts[i] + 1) for i, t in enumerate(final_toc_titles)]
             self.toc_pages_images = []
 
         self.total_pages = len(self.toc_pages_images) + len(self.page_map)
@@ -392,7 +454,6 @@ class EpubProcessor:
             pix = page.get_pixmap(matrix=mat, alpha=False)
 
             img_content = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            # Use self.screen_width (which is now dynamic)
             img_content = img_content.resize((self.screen_width, content_height), Image.Resampling.LANCZOS).convert("L")
 
             img = Image.new("RGB", (self.screen_width, self.screen_height), (255, 255, 255))
@@ -412,7 +473,9 @@ class EpubProcessor:
 
         page_num_disp = global_page_index + 1
         current_title = ""
+
         chapter_pages = [item[1] for item in self.toc_data_final]
+
         for title, start_pg in reversed(self.toc_data_final):
             if page_num_disp >= start_pg:
                 current_title = title
@@ -464,8 +527,9 @@ class App(ctk.CTk):
         super().__init__()
         self.processor = EpubProcessor()
         self.current_page_index = 0
-        self.debounce_timer = None  # <--- NEW: Timer for live updates
-        self.is_processing = False  # <--- NEW: Prevent overlapping threads
+        self.debounce_timer = None
+        self.is_processing = False
+        self.selected_chapter_indices = []
 
         self.title("EPUB to XTC Converter - Live Preview")
         self.geometry("1100x950")
@@ -480,20 +544,21 @@ class App(ctk.CTk):
         self.lbl_file.pack()
 
         self.var_toc = ctk.BooleanVar(value=True)
-        # Added command=self.schedule_update to checkbox
         self.check_toc = ctk.CTkCheckBox(self.sidebar, text="Generate TOC Pages", variable=self.var_toc,
                                          command=self.schedule_update)
         self.check_toc.pack(padx=20, pady=10, anchor="w")
 
+        self.btn_chapters = ctk.CTkButton(self.sidebar, text="Edit Chapter Visibility",
+                                          command=self.open_chapter_dialog, state="disabled", fg_color="gray")
+        self.btn_chapters.pack(padx=20, pady=5, fill="x")
+
         ctk.CTkLabel(self.sidebar, text="Orientation:").pack(pady=(10, 0))
         self.orientation_var = ctk.StringVar(value="Portrait")
-        # Added command=self.schedule_update
         self.orientation_dropdown = ctk.CTkOptionMenu(self.sidebar, values=["Portrait", "Landscape"],
                                                       variable=self.orientation_var, command=self.schedule_update)
         self.orientation_dropdown.pack(padx=20, pady=5, fill="x")
 
         ctk.CTkLabel(self.sidebar, text="Text Alignment:").pack(pady=(10, 0))
-        # Added command=self.schedule_update
         self.align_dropdown = ctk.CTkOptionMenu(self.sidebar, values=["justify", "left"], command=self.schedule_update)
         self.align_dropdown.set("justify")
         self.align_dropdown.pack(padx=20, pady=5, fill="x")
@@ -506,9 +571,8 @@ class App(ctk.CTk):
         self.font_dropdown = ctk.CTkOptionMenu(self.sidebar, values=self.font_options, command=self.on_font_change)
         self.font_dropdown.pack(padx=20, pady=5, fill="x")
 
-        self.lbl_preview_zoom = ctk.CTkLabel(self.sidebar, text="Preview Width: 300px")
+        self.lbl_preview_zoom = ctk.CTkLabel(self.sidebar, text="Preview Zoom: 300")
         self.lbl_preview_zoom.pack(pady=(20, 0))
-        # Note: Zoom does not need to re-process the book, only re-display the image
         self.slider_preview_zoom = ctk.CTkSlider(self.sidebar, from_=200, to=800, command=self.update_zoom_only)
         self.slider_preview_zoom.set(300)
         self.slider_preview_zoom.pack(padx=20, pady=5, fill="x")
@@ -550,7 +614,6 @@ class App(ctk.CTk):
         self.slider_padding.set(DEFAULT_BOTTOM_PADDING)
         self.slider_padding.pack(padx=20, pady=5, fill="x")
 
-        # Kept the manual button just in case
         self.btn_run = ctk.CTkButton(self.sidebar, text="Force Refresh", fg_color="gray", command=self.run_processing)
         self.btn_run.pack(padx=20, pady=20, fill="x")
 
@@ -570,42 +633,65 @@ class App(ctk.CTk):
 
         self.nav = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
         self.nav.pack(side="bottom", fill="x", pady=10)
-        ctk.CTkButton(self.nav, text="< Previous", width=100, command=self.prev_page).pack(side="left", padx=20)
-        self.lbl_page = ctk.CTkLabel(self.nav, text="Page 0/0", font=("Arial", 16))
-        self.lbl_page.pack(side="left", expand=True)
-        ctk.CTkButton(self.nav, text="Next >", width=100, command=self.next_page).pack(side="right", padx=20)
 
-    # --- NEW: CORE LIVE UPDATE LOGIC ---
-    def schedule_update(self, _=None):
-        """
-        Called when a slider moves.
-        Waits 800ms after the LAST movement before triggering the heavy processing.
-        """
-        if not self.processor.input_file:
-            return
+        ctk.CTkButton(self.nav, text="< Previous", width=90, command=self.prev_page).pack(side="left", padx=20)
+        ctk.CTkButton(self.nav, text="Next >", width=90, command=self.next_page).pack(side="right", padx=20)
 
-        # Cancel any pending update
-        if self.debounce_timer is not None:
-            self.after_cancel(self.debounce_timer)
+        self.center_nav = ctk.CTkFrame(self.nav, fg_color="transparent")
+        self.center_nav.pack(side="left", expand=True, fill="both")
 
-        # Schedule new update
-        self.progress_label.configure(text="Waiting for changes...")
-        self.debounce_timer = self.after(800, self.run_processing)
+        self.lbl_page = ctk.CTkLabel(self.center_nav, text="Page 0/0", font=("Arial", 16))
+        self.lbl_page.pack(side="top", pady=(0, 2))
+
+        self.goto_frame = ctk.CTkFrame(self.center_nav, fg_color="transparent")
+        self.goto_frame.pack(side="top")
+
+        self.entry_page = ctk.CTkEntry(self.goto_frame, width=60, height=24, placeholder_text="#")
+        self.entry_page.pack(side="left", padx=(0, 5))
+        self.entry_page.bind('<Return>', lambda event: self.go_to_page())
+
+        self.btn_go = ctk.CTkButton(self.goto_frame, text="Go", width=40, height=24, command=self.go_to_page)
+        self.btn_go.pack(side="left")
 
     def select_file(self):
         path = filedialog.askopenfilename(filetypes=[("EPUB", "*.epub")])
         if path:
             self.processor.input_file = path
+            self.current_page_index = 0
             self.lbl_file.configure(text=os.path.basename(path))
-            # AUTOMATICALLY TRIGGER PROCESSING ON LOAD
-            self.run_processing()
+            self.progress_label.configure(text="Parsing structure...")
+            threading.Thread(target=self._task_parse_structure).start()
 
-    # --- WRAPPERS FOR SLIDERS ---
-    # These update the label text immediately, then schedule the processing
+    def _task_parse_structure(self):
+        success = self.processor.parse_book_structure(self.processor.input_file)
+        self.after(0, lambda: self._on_structure_parsed(success))
+
+    def _on_structure_parsed(self, success):
+        if not success:
+            messagebox.showerror("Error", "Failed to parse EPUB.")
+            return
+
+        self.btn_chapters.configure(state="normal", fg_color="#3B8ED0")
+        self.open_chapter_dialog()
+
+    def open_chapter_dialog(self):
+        if not self.selected_chapter_indices:
+            self.selected_chapter_indices = list(range(len(self.processor.raw_chapters)))
+        ChapterSelectionDialog(self, self.processor.raw_chapters, self._on_chapters_selected)
+
+    def _on_chapters_selected(self, selected_indices):
+        self.selected_chapter_indices = selected_indices
+        self.run_processing()
+
+    def schedule_update(self, _=None):
+        if not self.processor.input_file: return
+        if self.debounce_timer is not None: self.after_cancel(self.debounce_timer)
+        self.progress_label.configure(text="Waiting for changes...")
+        self.debounce_timer = self.after(800, self.run_processing)
+
     def update_zoom_only(self, value):
-        self.lbl_preview_zoom.configure(text=f"Preview Width: {int(value)}px")
-        if self.processor.is_ready:
-            self.show_page(self.current_page_index)
+        self.lbl_preview_zoom.configure(text=f"Preview Zoom: {int(value)}")
+        if self.processor.is_ready: self.show_page(self.current_page_index)
 
     def on_font_change(self, choice):
         self.processor.font_path = self.font_map[choice]
@@ -635,28 +721,26 @@ class App(ctk.CTk):
         self.lbl_top_padding.configure(text=f"Top Padding: {int(value)}px")
         self.schedule_update()
 
-    # --- PROCESSING LOGIC ---
     def update_progress_ui(self, val, stage_text="Processing"):
         self.after(0, lambda: self.progress_bar.set(val))
         self.after(0, lambda: self.progress_label.configure(text=f"{stage_text}: {int(val * 100)}%"))
 
     def run_processing(self):
-        if not self.processor.input_file:
-            messagebox.showwarning("Warning", "Please select an EPUB file first.")
-            return
+        if not self.processor.input_file: return
+        if self.is_processing: return
 
-        if self.is_processing:
-            return  # Don't stack threads
+        if self.selected_chapter_indices is None:
+            self.selected_chapter_indices = list(range(len(self.processor.raw_chapters)))
 
         self.is_processing = True
         self.btn_run.configure(state="disabled", text="Rendering...", fg_color="orange")
         self.progress_label.configure(text="Starting layout...")
 
-        threading.Thread(target=self._task).start()
+        threading.Thread(target=self._task_render).start()
 
-    def _task(self):
-        success = self.processor.load_and_layout(
-            self.processor.input_file,
+    def _task_render(self):
+        success = self.processor.render_chapters(
+            self.selected_chapter_indices,
             self.processor.font_path,
             int(self.slider_size.get()),
             int(self.slider_margin.get()),
@@ -677,12 +761,9 @@ class App(ctk.CTk):
 
         if success:
             self.btn_export.configure(state="normal")
-
-            # Keep user on the same page they were viewing (clamped to new total)
             old_idx = self.current_page_index
             total = self.processor.total_pages
             new_idx = min(old_idx, total - 1)
-
             self.show_page(new_idx)
         else:
             messagebox.showerror("Error", "Processing failed.")
@@ -693,15 +774,38 @@ class App(ctk.CTk):
 
         img = self.processor.render_page(idx)
 
-        # Dynamic preview sizing based on zoom slider
-        target_w = int(self.slider_preview_zoom.get())
-        aspect_ratio = img.height / img.width
-        target_h = int(target_w * aspect_ratio)
+        # --- SMART SCALING LOGIC ---
+        # The slider controls the "Short Edge" (e.g. text width) in both orientations
+        # to ensure text remains readable and consistent.
+
+        base_size = int(self.slider_preview_zoom.get())
+
+        if img.width > img.height:
+            # Landscape: Slider controls Height
+            target_h = base_size
+            aspect_ratio = img.width / img.height
+            target_w = int(target_h * aspect_ratio)
+        else:
+            # Portrait: Slider controls Width
+            target_w = base_size
+            aspect_ratio = img.height / img.width
+            target_h = int(target_w * aspect_ratio)
 
         ctk_img = ctk.CTkImage(light_image=img, size=(target_w, target_h))
-
         self.img_label.configure(image=ctk_img, text="")
         self.lbl_page.configure(text=f"Page {idx + 1} / {self.processor.total_pages}")
+
+    def go_to_page(self):
+        if not self.processor.is_ready: return
+        txt = self.entry_page.get()
+        if not txt.isdigit():
+            return
+
+        target = int(txt)
+        target = max(1, min(target, self.processor.total_pages))
+
+        self.show_page(target - 1)
+        self.entry_page.delete(0, 'end')
 
     def prev_page(self):
         self.show_page(max(0, self.current_page_index - 1))
