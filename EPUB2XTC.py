@@ -464,7 +464,10 @@ class App(ctk.CTk):
         super().__init__()
         self.processor = EpubProcessor()
         self.current_page_index = 0
-        self.title("EPUB to XTC Converter")
+        self.debounce_timer = None  # <--- NEW: Timer for live updates
+        self.is_processing = False  # <--- NEW: Prevent overlapping threads
+
+        self.title("EPUB to XTC Converter - Live Preview")
         self.geometry("1100x950")
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -476,20 +479,22 @@ class App(ctk.CTk):
         self.lbl_file = ctk.CTkLabel(self.sidebar, text="No file", text_color="gray")
         self.lbl_file.pack()
 
-
         self.var_toc = ctk.BooleanVar(value=True)
-        self.check_toc = ctk.CTkCheckBox(self.sidebar, text="Generate TOC Pages", variable=self.var_toc)
+        # Added command=self.schedule_update to checkbox
+        self.check_toc = ctk.CTkCheckBox(self.sidebar, text="Generate TOC Pages", variable=self.var_toc,
+                                         command=self.schedule_update)
         self.check_toc.pack(padx=20, pady=10, anchor="w")
 
-        # --- UPDATED: Orientation Dropdown ---
         ctk.CTkLabel(self.sidebar, text="Orientation:").pack(pady=(10, 0))
         self.orientation_var = ctk.StringVar(value="Portrait")
+        # Added command=self.schedule_update
         self.orientation_dropdown = ctk.CTkOptionMenu(self.sidebar, values=["Portrait", "Landscape"],
-                                                      variable=self.orientation_var)
+                                                      variable=self.orientation_var, command=self.schedule_update)
         self.orientation_dropdown.pack(padx=20, pady=5, fill="x")
 
         ctk.CTkLabel(self.sidebar, text="Text Alignment:").pack(pady=(10, 0))
-        self.align_dropdown = ctk.CTkOptionMenu(self.sidebar, values=["justify", "left"])
+        # Added command=self.schedule_update
+        self.align_dropdown = ctk.CTkOptionMenu(self.sidebar, values=["justify", "left"], command=self.schedule_update)
         self.align_dropdown.set("justify")
         self.align_dropdown.pack(padx=20, pady=5, fill="x")
 
@@ -500,6 +505,13 @@ class App(ctk.CTk):
         self.font_map["Default (System)"] = "DEFAULT"
         self.font_dropdown = ctk.CTkOptionMenu(self.sidebar, values=self.font_options, command=self.on_font_change)
         self.font_dropdown.pack(padx=20, pady=5, fill="x")
+
+        self.lbl_preview_zoom = ctk.CTkLabel(self.sidebar, text="Preview Width: 300px")
+        self.lbl_preview_zoom.pack(pady=(20, 0))
+        # Note: Zoom does not need to re-process the book, only re-display the image
+        self.slider_preview_zoom = ctk.CTkSlider(self.sidebar, from_=200, to=800, command=self.update_zoom_only)
+        self.slider_preview_zoom.set(300)
+        self.slider_preview_zoom.pack(padx=20, pady=5, fill="x")
 
         self.lbl_size = ctk.CTkLabel(self.sidebar, text=f"Font Size: {DEFAULT_FONT_SIZE}pt")
         self.lbl_size.pack()
@@ -538,8 +550,8 @@ class App(ctk.CTk):
         self.slider_padding.set(DEFAULT_BOTTOM_PADDING)
         self.slider_padding.pack(padx=20, pady=5, fill="x")
 
-        self.btn_run = ctk.CTkButton(self.sidebar, text="Process / Update Preview", fg_color="green",
-                                     command=self.run_processing)
+        # Kept the manual button just in case
+        self.btn_run = ctk.CTkButton(self.sidebar, text="Force Refresh", fg_color="gray", command=self.run_processing)
         self.btn_run.pack(padx=20, pady=20, fill="x")
 
         self.btn_export = ctk.CTkButton(self.sidebar, text="Export XTC", state="disabled", command=self.export_file)
@@ -563,33 +575,67 @@ class App(ctk.CTk):
         self.lbl_page.pack(side="left", expand=True)
         ctk.CTkButton(self.nav, text="Next >", width=100, command=self.next_page).pack(side="right", padx=20)
 
+    # --- NEW: CORE LIVE UPDATE LOGIC ---
+    def schedule_update(self, _=None):
+        """
+        Called when a slider moves.
+        Waits 800ms after the LAST movement before triggering the heavy processing.
+        """
+        if not self.processor.input_file:
+            return
+
+        # Cancel any pending update
+        if self.debounce_timer is not None:
+            self.after_cancel(self.debounce_timer)
+
+        # Schedule new update
+        self.progress_label.configure(text="Waiting for changes...")
+        self.debounce_timer = self.after(800, self.run_processing)
+
     def select_file(self):
         path = filedialog.askopenfilename(filetypes=[("EPUB", "*.epub")])
         if path:
             self.processor.input_file = path
             self.lbl_file.configure(text=os.path.basename(path))
+            # AUTOMATICALLY TRIGGER PROCESSING ON LOAD
+            self.run_processing()
+
+    # --- WRAPPERS FOR SLIDERS ---
+    # These update the label text immediately, then schedule the processing
+    def update_zoom_only(self, value):
+        self.lbl_preview_zoom.configure(text=f"Preview Width: {int(value)}px")
+        if self.processor.is_ready:
+            self.show_page(self.current_page_index)
 
     def on_font_change(self, choice):
         self.processor.font_path = self.font_map[choice]
+        self.schedule_update()
 
     def update_size_label(self, value):
         self.lbl_size.configure(text=f"Font Size: {int(value)}pt")
+        self.schedule_update()
 
     def update_weight_label(self, value):
         self.lbl_weight.configure(text=f"Font Weight: {int(value)}")
+        self.schedule_update()
 
     def update_line_label(self, value):
         self.lbl_line.configure(text=f"Line Height: {value:.1f}")
+        self.schedule_update()
 
     def update_margin_label(self, value):
         self.lbl_margin.configure(text=f"Margin: {int(value)}px")
+        self.schedule_update()
 
     def update_padding_label(self, value):
         self.lbl_padding.configure(text=f"Bottom Padding: {int(value)}px")
+        self.schedule_update()
 
     def update_top_padding_label(self, value):
         self.lbl_top_padding.configure(text=f"Top Padding: {int(value)}px")
+        self.schedule_update()
 
+    # --- PROCESSING LOGIC ---
     def update_progress_ui(self, val, stage_text="Processing"):
         self.after(0, lambda: self.progress_bar.set(val))
         self.after(0, lambda: self.progress_label.configure(text=f"{stage_text}: {int(val * 100)}%"))
@@ -598,7 +644,14 @@ class App(ctk.CTk):
         if not self.processor.input_file:
             messagebox.showwarning("Warning", "Please select an EPUB file first.")
             return
-        self.btn_run.configure(state="disabled", text="Processing...")
+
+        if self.is_processing:
+            return  # Don't stack threads
+
+        self.is_processing = True
+        self.btn_run.configure(state="disabled", text="Rendering...", fg_color="orange")
+        self.progress_label.configure(text="Starting layout...")
+
         threading.Thread(target=self._task).start()
 
     def _task(self):
@@ -612,7 +665,6 @@ class App(ctk.CTk):
             int(self.slider_padding.get()),
             int(self.slider_top_padding.get()),
             text_align=self.align_dropdown.get(),
-            # --- UPDATED: Pass orientation ---
             orientation=self.orientation_var.get(),
             add_toc=self.var_toc.get(),
             progress_callback=lambda v: self.update_progress_ui(v, "Layout")
@@ -620,36 +672,34 @@ class App(ctk.CTk):
         self.after(0, lambda: self._done(success))
 
     def _done(self, success):
-        self.btn_run.configure(state="normal", text="Process / Update Preview")
+        self.is_processing = False
+        self.btn_run.configure(state="normal", text="Force Refresh", fg_color="green")
+
         if success:
             self.btn_export.configure(state="normal")
-            self.show_page(0)
+
+            # Keep user on the same page they were viewing (clamped to new total)
+            old_idx = self.current_page_index
+            total = self.processor.total_pages
+            new_idx = min(old_idx, total - 1)
+
+            self.show_page(new_idx)
         else:
             messagebox.showerror("Error", "Processing failed.")
 
     def show_page(self, idx):
         if not self.processor.is_ready: return
         self.current_page_index = idx
+
         img = self.processor.render_page(idx)
 
-        # --- UPDATED: Preview resizing logic to handle different aspect ratios ---
-        available_h = max(100, self.preview_frame.winfo_height() - 100)
-        available_w = max(100, self.preview_frame.winfo_width() - 50)
+        # Dynamic preview sizing based on zoom slider
+        target_w = int(self.slider_preview_zoom.get())
+        aspect_ratio = img.height / img.width
+        target_h = int(target_w * aspect_ratio)
 
-        # Calculate aspect ratios
-        img_aspect = img.width / img.height
-        frame_aspect = available_w / available_h
+        ctk_img = ctk.CTkImage(light_image=img, size=(target_w, target_h))
 
-        if img_aspect > frame_aspect:
-            # Limited by width
-            w = available_w
-            h = int(w / img_aspect)
-        else:
-            # Limited by height
-            h = available_h
-            w = int(h * img_aspect)
-
-        ctk_img = ctk.CTkImage(light_image=img, size=(w, h))
         self.img_label.configure(image=ctk_img, text="")
         self.lbl_page.configure(text=f"Page {idx + 1} / {self.processor.total_pages}")
 
